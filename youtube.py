@@ -1,50 +1,50 @@
 import asyncio
-import threading
 import yt_dlp
 
-_YDL_LOCK = threading.Lock()
-
 YDL_OPTS = {
-    "format": "bestaudio[abr>=128]/bestaudio/best",
+    "format": "bestaudio/best",
     "noplaylist": True,
     "quiet": True,
     "no_warnings": True,
     "default_search": "ytsearch1",
     "source_address": "0.0.0.0",
-    "nocheckcertificate": True,
-    "geo_bypass": True,
-    "cachedir": False,
+    "extractor_args": {
+        "youtube": {
+            "player_client": ["android_vr", "tv", "ios"],
+        }
+    },
 }
 
-_YDL = yt_dlp.YoutubeDL(YDL_OPTS)
 
-
-def _extract_sync(query: str) -> dict | None:
-    with _YDL_LOCK:
-        info = _YDL.extract_info(query, download=False)
-
-    if not info:
-        return None
-    if "entries" in info:
-        entries = list(info["entries"])
-        if not entries:
+def _extract(query: str) -> dict | None:
+    search_query = query if query.startswith(("http://", "https://")) else f"ytsearch1:{query}"
+    with yt_dlp.YoutubeDL(YDL_OPTS) as ydl:
+        info = ydl.extract_info(search_query, download=False)
+        if not info:
             return None
-        info = entries[0]
+        if "entries" in info:
+            entries = [e for e in info["entries"] if e]
+            if not entries:
+                return None
+            info = entries[0]
 
-    stream_url = info.get("url")
-    if not stream_url and info.get("requested_formats"):
-        stream_url = info["requested_formats"][0].get("url")
+        stream_url = info.get("url")
+        if not stream_url:
+            for fmt in reversed(info.get("formats", [])):
+                if fmt.get("acodec") != "none" and fmt.get("url"):
+                    stream_url = fmt["url"]
+                    break
 
-    if not stream_url:
-        return None
+        if not stream_url:
+            return None
 
-    return {
-        "title": info.get("title", "Unknown Song"),
-        "stream_url": stream_url,
-        "duration": info.get("duration", 0),
-        "link": info.get("webpage_url", ""),
-    }
+        return {
+            "title": info.get("title", "Unknown Track"),
+            "link": info.get("webpage_url", f"https://www.youtube.com/watch?v={info.get('id', '')}"),
+            "duration": info.get("duration", 0),
+            "stream_url": stream_url,
+        }
 
 
 async def get_audio_stream(query: str) -> dict | None:
-    return await asyncio.to_thread(_extract_sync, query)
+    return await asyncio.to_thread(_extract, query)

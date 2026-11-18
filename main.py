@@ -192,7 +192,21 @@ async def main():
                 f"**Details:** `{e}`"
             )
 
-        song = await song_task
+        try:
+            song = await asyncio.wait_for(song_task, timeout=25)
+        except asyncio.TimeoutError:
+            status = await status_task
+            return await status.edit_text(
+                "⏳ **Search Timed Out**\n"
+                "YouTube took too long to respond. Please try again."
+            )
+        except Exception as e:
+            status = await status_task
+            return await status.edit_text(
+                "❌ **YouTube Error**\n"
+                f"**Details:** `{e}`"
+            )
+
         if not song or not song.get("stream_url"):
             status = await status_task
             return await status.edit_text(
