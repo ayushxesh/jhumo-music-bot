@@ -1,5 +1,7 @@
 import asyncio
+import threading
 from collections import deque
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from pyrogram import Client, filters, idle
 from pyrogram.errors import UserNotParticipant
 from pyrogram.types import (
@@ -16,6 +18,21 @@ from youtube import get_audio_stream
 
 queues: dict[int, deque] = {}
 verified_chats: set[int] = set()
+
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Music Bot is Live")
+
+    def log_message(self, format, *args):
+        pass
+
+
+def start_health_server():
+    server = HTTPServer(("0.0.0.0", 7860), HealthHandler)
+    server.serve_forever()
 
 
 def format_duration(seconds: int) -> str:
@@ -44,6 +61,8 @@ def control_buttons():
 
 
 async def main():
+    threading.Thread(target=start_health_server, daemon=True).start()
+
     bot = Client(
         "JhumoBot",
         api_id=config.API_ID,
@@ -130,7 +149,7 @@ async def main():
     async def start_cmd(_, message: Message):
         await message.reply_text(
             "🎶 **Welcome to Jhumo Music Bot**\n\n"
-            "Stream high-quality audio directly from YouTube into your group's Voice Chat.\n\n"
+            "Stream high-quality audio directly from YouTube into your group's Voice Chat with minimal latency.\n\n"
             "**Available Commands:**\n"
             "• `/play <song name or lyrics>` — Play a track or add it to the queue\n"
             "• `/pause` — Pause the current stream\n"
