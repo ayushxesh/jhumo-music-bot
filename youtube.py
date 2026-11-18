@@ -5,7 +5,7 @@ import yt_dlp
 COOKIE_FILE = "/tmp/cookies.txt"
 
 
-def _setup_cookies() -> str | None:
+def _init_cookies() -> str | None:
     cookies_content = os.environ.get("YOUTUBE_COOKIES", "").strip()
     if cookies_content:
         clean_cookies = cookies_content.replace("\r\n", "\n")
@@ -17,75 +17,60 @@ def _setup_cookies() -> str | None:
     return None
 
 
+ACTIVE_COOKIE_FILE = _init_cookies()
+
+
 def _extract(query: str) -> dict | None:
-    base_opts = {
+    ydl_opts = {
         "format": "bestaudio/best",
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
+        "ignoreerrors": True,
         "source_address": "0.0.0.0",
         "extractor_args": {
             "youtube": {
-                "player_client": ["tv", "web_safari", "mweb"],
+                "player_client": ["mweb", "web"],
             }
         },
     }
 
-    cookie_path = _setup_cookies()
-    if cookie_path:
-        base_opts["cookiefile"] = cookie_path
+    if ACTIVE_COOKIE_FILE:
+        ydl_opts["cookiefile"] = ACTIVE_COOKIE_FILE
 
-    if query.startswith(("http://", "https://")):
-        candidates = [query]
-    else:
-        search_opts = {**base_opts, "extract_flat": "in_playlist"}
-        with yt_dlp.YoutubeDL(search_opts) as ydl:
-            search_info = ydl.extract_info(f"ytsearch5:{query}", download=False)
-            entries = search_info.get("entries", []) if search_info else []
-            candidates = []
-            for entry in entries:
-                if not entry:
-                    continue
-                url = entry.get("url") or (
-                    f"https://www.youtube.com/watch?v={entry['id']}"
-                    if entry.get("id")
-                    else None
-                )
-                if url:
-                    candidates.append(url)
+    search_query = (
+        query if query.startswith(("http://", "https://")) else f"ytsearch2:{query}"
+    )
 
-    if not candidates:
-        return None
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(search_query, download=False)
+        if not info:
+            return None
 
-    last_error = None
-    with yt_dlp.YoutubeDL(base_opts) as ydl:
-        for url in candidates:
-            try:
-                info = ydl.extract_info(url, download=False)
-                if not info:
-                    continue
+        if "entries" in info:
+            entries = [e for e in info["entries"] if e]
+            if not entries:
+                return None
+            info = entries[0]
 
-                stream_url = info.get("url")
-                if not stream_url:
-                    for fmt in reversed(info.get("formats", [])):
-                        if fmt.get("acodec") != "none" and fmt.get("url"):
-                            stream_url = fmt["url"]
-                            break
+        stream_url = info.get("url")
+        if not stream_url:
+            for fmt in reversed(info.get("formats", [])):
+                if fmt.get("acodec") != "none" and fmt.get("url"):
+                    stream_url = fmt["url"]
+                    break
 
-                if stream_url:
-                    return {
-                        "title": info.get("title", "Unknown Track"),
-                        "link": info.get("webpage_url", url),
-                        "duration": info.get("duration", 0),
-                        "stream_url": stream_url,
-                    }
-            except Exception as e:
-                last_error = e
-                continue
+        if not stream_url:
+            return None
 
-    if last_error:
-        raise last_error
-    return None
+        return {
+            "title": info.get("title", "Unknown Track"),
+            "link": info.get(
+                "webpage_url", f"https://www.youtube.com/watch?v={info.get('id', '')}"
+            ),
+            "duration": info.get("duration", 0),
+            "stream_url": stream_url,
+        }
 
 
 async def get_audio_stream(query: str) -> dict | None:

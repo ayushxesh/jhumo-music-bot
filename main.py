@@ -193,7 +193,7 @@ async def main():
             )
 
         try:
-            song = await asyncio.wait_for(song_task, timeout=25)
+            song = await asyncio.wait_for(song_task, timeout=45)
         except asyncio.TimeoutError:
             status = await status_task
             return await status.edit_text(
