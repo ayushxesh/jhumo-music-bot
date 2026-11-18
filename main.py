@@ -1,8 +1,9 @@
+import os
 import asyncio
 import threading
 from collections import deque
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from pyrogram import Client, filters, idle
+from pyrogram import Client, filters
 from pyrogram.errors import UserNotParticipant
 from pyrogram.types import (
     Message,
@@ -23,15 +24,18 @@ verified_chats: set[int] = set()
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
+        self.send_header("Content-type", "text/plain")
         self.end_headers()
-        self.wfile.write(b"Music Bot is Live")
+        self.wfile.write(b"Jhumo Music Bot is Live!")
 
     def log_message(self, format, *args):
         pass
 
 
 def start_health_server():
-    server = HTTPServer(("0.0.0.0", 7860), HealthHandler)
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    print(f"🌐 Health server listening on port {port}", flush=True)
     server.serve_forever()
 
 
@@ -68,6 +72,7 @@ async def main():
         api_id=config.API_ID,
         api_hash=config.API_HASH,
         bot_token=config.BOT_TOKEN,
+        in_memory=True,
     )
 
     assistant = Client(
@@ -75,6 +80,7 @@ async def main():
         api_id=config.API_ID,
         api_hash=config.API_HASH,
         session_string=config.STRING_SESSION,
+        in_memory=True,
     )
 
     call_py = PyTgCalls(assistant)
@@ -282,8 +288,8 @@ async def main():
     me = await bot.get_me()
     await assistant.start()
     await call_py.start()
-    print(f"✅ @{me.username} is LIVE!")
-    await idle()
+    print(f"✅ @{me.username} is LIVE!", flush=True)
+    await asyncio.Event().wait()
 
 
 if __name__ == "__main__":
