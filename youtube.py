@@ -20,57 +20,87 @@ def _init_cookies() -> str | None:
 ACTIVE_COOKIE_FILE = _init_cookies()
 
 
+def _priority_score(entry: dict) -> int:
+    title = (entry.get("title") or "").lower()
+    channel = (entry.get("channel") or entry.get("uploader") or "").lower()
+    if "- topic" in channel:
+        return 0
+    if any(word in title for word in ("audio", "lyrical", "lyrics")):
+        return 1
+    return 2
+
+
 def _extract(query: str) -> dict | None:
-    ydl_opts = {
-        "format": "bestaudio/best",
+    base_opts = {
+        "format": "bestaudio[ext=m4a]/bestaudio/best",
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
-        "ignoreerrors": True,
         "source_address": "0.0.0.0",
         "extractor_args": {
             "youtube": {
-                "player_client": ["mweb", "web"],
+                "player_client": ["tv", "web_safari"],
             }
         },
     }
 
     if ACTIVE_COOKIE_FILE:
-        ydl_opts["cookiefile"] = ACTIVE_COOKIE_FILE
+        base_opts["cookiefile"] = ACTIVE_COOKIE_FILE
 
-    search_query = (
-        query if query.startswith(("http://", "https://")) else f"ytsearch2:{query}"
-    )
-
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(search_query, download=False)
-        if not info:
-            return None
-
-        if "entries" in info:
-            entries = [e for e in info["entries"] if e]
-            if not entries:
-                return None
-            info = entries[0]
-
-        stream_url = info.get("url")
-        if not stream_url:
-            for fmt in reversed(info.get("formats", [])):
-                if fmt.get("acodec") != "none" and fmt.get("url"):
-                    stream_url = fmt["url"]
-                    break
-
-        if not stream_url:
-            return None
-
-        return {
-            "title": info.get("title", "Unknown Track"),
-            "link": info.get(
-                "webpage_url", f"https://www.youtube.com/watch?v={info.get('id', '')}"
-            ),
-            "duration": info.get("duration", 0),
-            "stream_url": stream_url,
+    if query.startswith(("http://", "https://")):
+        candidates = [query]
+    else:
+        search_opts = {
+            **base_opts,
+            "extract_flat": "in_playlist",
         }
+        with yt_dlp.YoutubeDL(search_opts) as ydl:
+            search_info = ydl.extract_info(f"ytsearch4:{query}", download=False)
+            entries = [e for e in (search_info.get("entries") or []) if e]
+            entries.sort(key=_priority_score)
+
+            candidates = []
+            for entry in entries[:3]:
+                url = entry.get("url") or (
+                    f"https://www.youtube.com/watch?v={entry['id']}"
+                    if entry.get("id")
+                    else None
+                )
+                if url:
+                    candidates.append(url)
+
+    if not candidates:
+        return None
+
+    last_error = None
+    with yt_dlp.YoutubeDL(base_opts) as ydl:
+        for url in candidates:
+            try:
+                info = ydl.extract_info(url, download=False)
+                if not info:
+                    continue
+
+                stream_url = info.get("url")
+                if not stream_url:
+                    for fmt in reversed(info.get("formats", [])):
+                        if fmt.get("acodec") != "none" and fmt.get("url"):
+                            stream_url = fmt["url"]
+                            break
+
+                if stream_url:
+                    return {
+                        "title": info.get("title", "Unknown Track"),
+                        "link": info.get("webpage_url", url),
+                        "duration": info.get("duration", 0),
+                        "stream_url": stream_url,
+                    }
+            except Exception as e:
+                last_error = e
+                continue
+
+    if last_error:
+        raise last_error
+    return None
 
 
 async def get_audio_stream(query: str) -> dict | None:
