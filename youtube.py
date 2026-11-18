@@ -1,5 +1,21 @@
+import os
 import asyncio
 import yt_dlp
+
+COOKIE_FILE = "/tmp/cookies.txt"
+
+def _init_cookies() -> str | None:
+    cookies_content = os.environ.get("YOUTUBE_COOKIES", "").strip()
+    if cookies_content:
+        clean_cookies = cookies_content.replace("\r\n", "\n")
+        with open(COOKIE_FILE, "w", encoding="utf-8", newline="\n") as f:
+            f.write(clean_cookies + "\n")
+        return COOKIE_FILE
+    if os.path.exists("cookies.txt"):
+        return "cookies.txt"
+    return None
+
+ACTIVE_COOKIE_FILE = _init_cookies()
 
 def _extract(query: str) -> dict | None:
     ydl_opts = {
@@ -10,10 +26,13 @@ def _extract(query: str) -> dict | None:
         "source_address": "0.0.0.0",
         "extractor_args": {
             "youtube": {
-                "player_client": ["ios", "android"],
+                "player_client": ["ios", "android", "web"],
             }
         },
     }
+
+    if ACTIVE_COOKIE_FILE:
+        ydl_opts["cookiefile"] = ACTIVE_COOKIE_FILE
 
     search_query = query if query.startswith(("http://", "https://")) else f"ytsearch1:{query}"
     
