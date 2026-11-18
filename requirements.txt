@@ -1,4 +1,5 @@
 pyrogram
 py-tgcalls
 TgCrypto
+python-dotenv
 https://github.com/yt-dlp/yt-dlp/archive/master.zip
