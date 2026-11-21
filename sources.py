@@ -10,6 +10,10 @@ import config
 
 COOKIE_FILE = "/tmp/cookies.txt"
 SOURCE_TIMEOUT = 25
+RESOLVE_ATTEMPTS = (
+    None,
+    ("android", "ios", "web"),
+)
 
 _cache: "OrderedDict[str, tuple[float, dict]]" = OrderedDict()
 _yt_last_block = 0.0
@@ -119,52 +123,67 @@ def _pick_stream_url(info: dict) -> str | None:
 
 def _yt_sync(query: str) -> dict | None:
     debug = os.environ.get("YT_DEBUG") == "1"
-
-    opts = {
-        "format": "bestaudio[ext=m4a]/bestaudio/best",
-        "noplaylist": True,
-        "quiet": not debug,
-        "verbose": debug,
-        "no_warnings": True,
-        "socket_timeout": 8,
-        "source_address": "0.0.0.0",
-        "skip_download": True,
-    }
-    if ACTIVE_COOKIE_FILE:
-        opts["cookiefile"] = ACTIVE_COOKIE_FILE
-    if config.YT_PROXY:
-        opts["proxy"] = config.YT_PROXY
-
-    ea = {}
-    if config.POT_URL:
-        ea["youtubepot-bgutilhttp"] = {"base_url": [config.POT_URL]}
-    clients = os.environ.get("YT_CLIENTS", "").strip()
-    if clients:
-        ea["youtube"] = {
-            "player_client": [c.strip() for c in clients.split(",") if c.strip()]
-        }
-    if ea:
-        opts["extractor_args"] = ea
-
     target = query if query.startswith(("http://", "https://")) else f"ytsearch1:{query}"
+    last_error = None
 
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(target, download=False)
+    for attempt_clients in RESOLVE_ATTEMPTS:
+        opts = {
+            "format": "bestaudio[ext=m4a]/bestaudio/best",
+            "noplaylist": True,
+            "quiet": not debug,
+            "verbose": debug,
+            "no_warnings": True,
+            "socket_timeout": 6,
+            "source_address": "0.0.0.0",
+            "skip_download": True,
+            "retries": 1,
+            "fragment_retries": 1,
+        }
+        if ACTIVE_COOKIE_FILE:
+            opts["cookiefile"] = ACTIVE_COOKIE_FILE
+        if config.YT_PROXY:
+            opts["proxy"] = config.YT_PROXY
 
-    if info and info.get("entries"):
-        info = next((e for e in info["entries"] if e), None)
-    if not info:
-        return None
+        ea = {}
+        if config.POT_URL:
+            ea["youtubepot-bgutilhttp"] = {"base_url": [config.POT_URL]}
 
-    stream_url = _pick_stream_url(info)
-    if not stream_url:
-        return None
-    return {
-        "title": info.get("title", "Unknown Track"),
-        "link": info.get("webpage_url", target),
-        "duration": info.get("duration", 0) or 0,
-        "stream_url": stream_url,
-    }
+        clients = os.environ.get("YT_CLIENTS", "").strip()
+        selected_clients = (
+            [c.strip() for c in clients.split(",") if c.strip()]
+            if clients
+            else attempt_clients
+        )
+        if selected_clients:
+            ea["youtube"] = {"player_client": list(selected_clients)}
+        if ea:
+            opts["extractor_args"] = ea
+
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(target, download=False)
+        except Exception as e:
+            last_error = e
+            continue
+
+        if info and info.get("entries"):
+            info = next((e for e in info["entries"] if e), None)
+        if not info:
+            continue
+
+        stream_url = _pick_stream_url(info)
+        if not stream_url:
+            continue
+        return {
+            "title": info.get("title", "Unknown Track"),
+            "link": info.get("webpage_url", target),
+            "duration": info.get("duration", 0) or 0,
+            "stream_url": stream_url,
+        }
+
+    if last_error:
+        raise last_error
+    return None
 
 
 async def _source_youtube(query: str) -> dict | None:
@@ -176,7 +195,17 @@ async def _source_youtube(query: str) -> dict | None:
         return result
     except Exception as e:
         msg = str(e).lower()
-        if "sign in" in msg or "not a bot" in msg:
+        block_markers = (
+            "sign in",
+            "not a bot",
+            "confirm you're not a bot",
+            "confirm you are not a bot",
+            "access denied",
+            "request blocked",
+            "temporarily unavailable",
+            "http error 403",
+        )
+        if any(marker in msg for marker in block_markers):
             _yt_last_block = time.time()
             print("⚠️ YouTube bot-check aaya", flush=True)
             if _block_callback and time.time() - _last_alert > 3600:

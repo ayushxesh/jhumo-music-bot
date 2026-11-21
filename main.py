@@ -297,7 +297,8 @@ async def main():
             if youtube_is_blocked():
                 return await status.edit_text(
                     "⚠️ **YouTube is temporarily blocking requests.**\n"
-                    "The owner has been notified. Please try again later."
+                    "The owner has been notified. "
+                    "For the fastest fix, update the bot's `cookies.txt` or POT provider."
                 )
             return await status.edit_text(
                 "❌ **No Results Found**\nTry a different title or add the artist name."
