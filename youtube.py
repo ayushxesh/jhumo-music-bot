@@ -1,16 +1,24 @@
 import os
+import time
 import asyncio
 import yt_dlp
 
 COOKIE_FILE = "/tmp/cookies.txt"
+CACHE_TTL = 3600          # 1 ghanta
+YT_COOLDOWN = 900         # YouTube block hone par 15 min skip
+YT_ENABLED = os.environ.get("YT_ENABLED", "1") == "1"
+YT_PROXY = os.environ.get("YT_PROXY", "").strip() or None
+
+_cache: dict[str, tuple[float, dict]] = {}
+_yt_blocked_until = 0.0
 
 
 def _init_cookies() -> str | None:
     cookies_content = os.environ.get("YOUTUBE_COOKIES", "").strip()
     if cookies_content:
-        clean_cookies = cookies_content.replace("\r\n", "\n")
+        clean = cookies_content.replace("\r\n", "\n")
         with open(COOKIE_FILE, "w", encoding="utf-8", newline="\n") as f:
-            f.write(clean_cookies + "\n")
+            f.write(clean + "\n")
         return COOKIE_FILE
     if os.path.exists("cookies.txt"):
         return "cookies.txt"
@@ -20,124 +28,135 @@ def _init_cookies() -> str | None:
 ACTIVE_COOKIE_FILE = _init_cookies()
 
 
-def _priority_score(entry: dict) -> int:
-    title = (entry.get("title") or "").lower()
-    channel = (entry.get("channel") or entry.get("uploader") or "").lower()
-    if "- topic" in channel:
-        return 0
-    if any(word in title for word in ("audio", "lyrical", "lyrics")):
-        return 1
-    return 2
+def _is_preview(fmt: dict) -> bool:
+    text = f"{fmt.get('format_id', '')} {fmt.get('url', '')}".lower()
+    return "preview" in text
 
 
 def _pick_stream_url(info: dict) -> str | None:
-    if info.get("url") and info.get("acodec") != "none":
+    if (
+        info.get("url")
+        and info.get("acodec") not in (None, "none")
+        and not _is_preview(info)
+    ):
         return info["url"]
 
     formats = info.get("formats") or []
-    # Prefer direct HTTP/HTTPS audio streams first for smooth PyTgCalls playback
+
+    # 1) direct http(s) audio
     for fmt in reversed(formats):
         if (
             fmt.get("acodec") not in (None, "none")
             and fmt.get("vcodec") in (None, "none")
             and fmt.get("url")
-            and str(fmt.get("protocol", "")).startswith("http")
-            and "m3u8" not in str(fmt.get("protocol", ""))
+            and str(fmt.get("protocol", "")) in ("http", "https")
+            and not _is_preview(fmt)
         ):
             return fmt["url"]
 
+    # 2) koi bhi audio (HLS bhi chalega)
     for fmt in reversed(formats):
-        if fmt.get("acodec") not in (None, "none") and fmt.get("url"):
+        if (
+            fmt.get("acodec") not in (None, "none")
+            and fmt.get("url")
+            and not _is_preview(fmt)
+        ):
             return fmt["url"]
 
-    return info.get("url")
+    return None
+
+
+def _result(info: dict, fallback_link: str, stream_url: str) -> dict:
+    return {
+        "title": info.get("title", "Unknown Track"),
+        "link": info.get("webpage_url", fallback_link),
+        "duration": info.get("duration", 0),
+        "stream_url": stream_url,
+    }
 
 
 def _try_youtube(query: str) -> dict | None:
-    base_opts = {
-        "format": "bestaudio/best",
+    opts = {
+        "format": "bestaudio[ext=m4a]/bestaudio/best",
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
         "socket_timeout": 8,
         "source_address": "0.0.0.0",
+        "skip_download": True,
     }
     if ACTIVE_COOKIE_FILE:
-        base_opts["cookiefile"] = ACTIVE_COOKIE_FILE
+        opts["cookiefile"] = ACTIVE_COOKIE_FILE
+    if YT_PROXY:
+        opts["proxy"] = YT_PROXY
 
-    if query.startswith(("http://", "https://")):
-        candidates = [query]
-    else:
-        search_opts = {**base_opts, "extract_flat": "in_playlist"}
-        with yt_dlp.YoutubeDL(search_opts) as ydl:
-            search_info = ydl.extract_info(f"ytsearch3:{query}", download=False)
-            entries = [e for e in (search_info.get("entries") or []) if e]
-            entries.sort(key=_priority_score)
-            candidates = [
-                entry.get("url") or f"https://www.youtube.com/watch?v={entry['id']}"
-                for entry in entries
-                if entry.get("url") or entry.get("id")
-            ]
+    target = query if query.startswith(("http://", "https://")) else f"ytsearch1:{query}"
 
-    with yt_dlp.YoutubeDL(base_opts) as ydl:
-        for url in candidates:
-            try:
-                info = ydl.extract_info(url, download=False)
-                if not info:
-                    continue
-                stream_url = _pick_stream_url(info)
-                if stream_url:
-                    return {
-                        "title": info.get("title", "Unknown Track"),
-                        "link": info.get("webpage_url", url),
-                        "duration": info.get("duration", 0),
-                        "stream_url": stream_url,
-                    }
-            except Exception:
-                continue
-    return None
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(target, download=False)
+
+    if info and info.get("entries"):
+        info = next((e for e in info["entries"] if e), None)
+    if not info:
+        return None
+
+    stream_url = _pick_stream_url(info)
+    return _result(info, target, stream_url) if stream_url else None
 
 
 def _try_soundcloud(query: str) -> dict | None:
-    sc_opts = {
+    opts = {
         "format": "bestaudio/best",
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
         "socket_timeout": 10,
         "source_address": "0.0.0.0",
+        "skip_download": True,
     }
-    with yt_dlp.YoutubeDL(sc_opts) as ydl:
-        info = ydl.extract_info(f"scsearch3:{query}", download=False)
-        entries = [e for e in (info.get("entries") or []) if e] if info else []
-        for entry in entries:
-            stream_url = _pick_stream_url(entry)
-            if stream_url:
-                return {
-                    "title": entry.get("title", "Unknown Track"),
-                    "link": entry.get("webpage_url", "https://soundcloud.com"),
-                    "duration": entry.get("duration", 0),
-                    "stream_url": stream_url,
-                }
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(f"scsearch2:{query}", download=False)
+
+    for entry in (info.get("entries") or []) if info else []:
+        if not entry:
+            continue
+        stream_url = _pick_stream_url(entry)
+        if stream_url:
+            return _result(entry, "https://soundcloud.com", stream_url)
     return None
 
 
 def _extract(query: str) -> dict | None:
-    # 1. Try YouTube first
-    try:
-        yt_result = _try_youtube(query)
-        if yt_result:
-            return yt_result
-    except Exception:
-        pass
+    global _yt_blocked_until
 
-    # 2. Automatic fallback to SoundCloud (works 24/7 on Render without cookies)
-    if not query.startswith(("http://", "https://")):
-        sc_result = _try_soundcloud(query)
-        if sc_result:
-            return sc_result
+    key = query.strip().lower()
+    hit = _cache.get(key)
+    if hit and time.time() - hit[0] < CACHE_TTL:
+        return hit[1]
 
-    return None
+    is_url = query.startswith(("http://", "https://"))
+    result = None
+
+    if YT_ENABLED and time.time() >= _yt_blocked_until:
+        try:
+            result = _try_youtube(query)
+        except Exception as e:
+            msg = str(e).lower()
+            if "sign in" in msg or "not a bot" in msg:
+                _yt_blocked_until = time.time() + YT_COOLDOWN
+                print("⚠️ YouTube bot-check: 15 min ke liye SoundCloud use hoga", flush=True)
+            else:
+                print(f"YouTube error: {e}", flush=True)
+
+    if not result and not is_url:
+        try:
+            result = _try_soundcloud(query)
+        except Exception as e:
+            print(f"SoundCloud error: {e}", flush=True)
+
+    if result:
+        _cache[key] = (time.time(), result)
+    return result
 
 
 async def get_audio_stream(query: str) -> dict | None:

@@ -1,5 +1,5 @@
 pyrofork
-py-tgcalls
+py-tgcalls==3.0.1
 TgCrypto
 python-dotenv
-https://github.com/yt-dlp/yt-dlp/archive/master.zip
+yt-dlp[default]

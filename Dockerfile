@@ -1,17 +1,15 @@
 FROM python:3.11-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg \
-    nodejs \
-    gcc \
-    python3-dev \
+    ffmpeg git curl unzip ca-certificates gcc python3-dev \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /app
+RUN curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh \
+    && deno --version
 
+WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade -r requirements.txt
-
 COPY . .
 
 CMD ["python", "-u", "main.py"]
