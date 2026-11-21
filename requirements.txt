@@ -3,3 +3,4 @@ py-tgcalls==3.0.1
 TgCrypto
 python-dotenv
 yt-dlp[default]
+bgutil-ytdlp-pot-provider==2.0.2

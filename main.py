@@ -1,10 +1,11 @@
 import os
 import asyncio
 import threading
-from collections import deque
+from collections import deque, defaultdict
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 from pyrogram import Client, filters
+from pyrogram.enums import ChatMemberStatus
 from pyrogram.errors import UserNotParticipant
 from pyrogram.types import (
     Message,
@@ -17,17 +18,26 @@ from pytgcalls.types import MediaStream, AudioQuality, Update
 
 try:
     from pytgcalls.types import ChatUpdate
-except ImportError:  # v3 me naam alag ho to bot crash na ho
+except ImportError:
     ChatUpdate = None
 
 import config
-from youtube import get_audio_stream
+from sources import (
+    get_audio_stream,
+    set_cookies,
+    set_block_callback,
+    keep_pot_alive,
+    youtube_is_blocked,
+)
 
 queues: dict[int, deque] = {}
+locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 verified_chats: set[int] = set()
 
 FFMPEG_PARAMS = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
 
+
+# ---------------- health server (Render ke liye) ----------------
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -46,6 +56,8 @@ def start_health_server():
     print(f"🌐 Health server listening on port {port}", flush=True)
     server.serve_forever()
 
+
+# ---------------- utils ----------------
 
 def format_duration(seconds: int) -> str:
     if not seconds:
@@ -105,6 +117,21 @@ async def main():
             await assistant.join_chat(invite_link)
         verified_chats.add(chat_id)
 
+    async def can_control(chat_id: int, user_id: int | None) -> bool:
+        # anonymous admin (from_user None) ko allow karo
+        if user_id is None:
+            return True
+        if user_id in config.OWNER_IDS:
+            return True
+        try:
+            member = await bot.get_chat_member(chat_id, user_id)
+            if member.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
+                return True
+        except Exception:
+            pass
+        queue = queues.get(chat_id)
+        return bool(queue and queue[0].get("requester_id") == user_id)
+
     async def send_now_playing(
         chat_id: int, song: dict, status_task: asyncio.Task | None = None
     ):
@@ -136,10 +163,7 @@ async def main():
     async def start_stream(
         chat_id: int, song: dict, status_task: asyncio.Task | None = None
     ):
-        print(
-            f"▶️ STREAM: {song['title']} | {song['stream_url'][:100]}",
-            flush=True,
-        )
+        print(f"▶️ STREAM: {song['title']} | {song['stream_url'][:100]}", flush=True)
         await call_py.play(
             chat_id,
             MediaStream(
@@ -152,24 +176,31 @@ async def main():
         asyncio.create_task(send_now_playing(chat_id, song, status_task))
 
     async def play_next(chat_id: int):
-        queue = queues.get(chat_id)
-        if queue:
-            queue.popleft()
-
-        # Agla song fail ho jaye to usse skip karke uske baad wala try karo
-        while queue and len(queue) > 0:
-            try:
-                await start_stream(chat_id, queue[0])
-                return
-            except Exception as e:
-                print(f"Next track failed, skipping: {e}", flush=True)
+        async with locks[chat_id]:
+            queue = queues.get(chat_id)
+            if queue:
                 queue.popleft()
 
-        queues.pop(chat_id, None)
-        try:
-            await call_py.leave_call(chat_id)
-        except Exception:
-            pass
+            while queue:
+                try:
+                    await start_stream(chat_id, queue[0])
+                    return
+                except Exception as e:
+                    print(f"Next track failed, skipping: {e}", flush=True)
+                    skipped = queue.popleft()
+                    try:
+                        await bot.send_message(
+                            chat_id,
+                            f"⚠️ Could not play **{skipped['title']}**, skipping.",
+                        )
+                    except Exception:
+                        pass
+
+            queues.pop(chat_id, None)
+            try:
+                await call_py.leave_call(chat_id)
+            except Exception:
+                pass
 
     # ---------- call events ----------
 
@@ -177,7 +208,6 @@ async def main():
     async def on_stream_end(_, update: Update):
         await play_next(update.chat_id)
 
-    # VC band/kick hone par purani queue saaf karo
     if ChatUpdate is not None:
         try:
 
@@ -200,28 +230,37 @@ async def main():
     async def start_cmd(_, message: Message):
         await message.reply_text(
             "🎶 **Welcome to Jhumo Music Bot**\n\n"
-            "Stream high-quality audio directly into your group's Voice Chat "
-            "with minimal latency.\n\n"
-            "**Available Commands:**\n"
-            "• `/play <song name or lyrics>` — Play a track or add it to the queue\n"
-            "• `/pause` — Pause the current stream\n"
-            "• `/resume` — Resume playback\n"
-            "• `/skip` — Skip to the next track\n"
-            "• `/stop` — Stop playback and leave Voice Chat\n"
-            "• `/queue` — View the upcoming playlist"
+            "Stream music into your group's Voice Chat.\n\n"
+            "**Setup:** Add me to your group, make me **Admin** "
+            "(with *Invite Users via Link*), start a **Voice Chat**, then use /play.\n\n"
+            "**Commands:**\n"
+            "• `/play <song name>` — Play or queue a track\n"
+            "• `/pause` / `/resume` — Pause or resume\n"
+            "• `/skip` — Next track\n"
+            "• `/stop` — Stop and leave Voice Chat\n"
+            "• `/queue` — Show the queue\n"
+            "• `/ping` — Check if I'm alive\n\n"
+            "_Pause, skip and stop can be used by group admins or the person who requested the current track._"
         )
+
+    @bot.on_message(filters.command("ping"))
+    async def ping_cmd(_, message: Message):
+        await message.reply_text("🏓 Pong! Bot is alive.")
 
     @bot.on_message(filters.command("play") & filters.group)
     async def play_cmd(_, message: Message):
         if len(message.command) < 2:
             return await message.reply_text(
-                "⚠️ **Usage:** Please provide a song name or lyrics.\n"
-                "**Example:** `/play Kesariya`"
+                "⚠️ **Usage:** `/play <song name>`\n**Example:** `/play Kesariya`"
             )
 
-        query = message.text.split(None, 1)[1]
+        query = message.text.split(None, 1)[1].strip()
+        if len(query) > 200:
+            return await message.reply_text("⚠️ Query too long (max 200 characters).")
+
         chat_id = message.chat.id
-        requester = message.from_user.mention if message.from_user else "User"
+        user_id = message.from_user.id if message.from_user else None
+        requester = message.from_user.mention if message.from_user else "Anonymous"
 
         status_task = asyncio.create_task(message.reply_text("🔎 **Searching...**"))
         assistant_task = asyncio.create_task(ensure_assistant(chat_id))
@@ -231,12 +270,12 @@ async def main():
             await assistant_task
         except Exception as e:
             song_task.cancel()
+            print(f"Assistant join failed in {chat_id}: {e}", flush=True)
             status = await status_task
             return await status.edit_text(
                 "❌ **Assistant Join Failed**\n"
-                "Please promote the bot to **Admin** with the "
-                "*Invite Users via Link* permission.\n\n"
-                f"**Details:** `{e}`"
+                "Please make me **Admin** with the *Invite Users via Link* permission, "
+                "then try again."
             )
 
         try:
@@ -244,91 +283,123 @@ async def main():
         except asyncio.TimeoutError:
             status = await status_task
             return await status.edit_text(
-                "⏳ **Search Timed Out**\n"
-                "The music source took too long to respond. Please try again."
+                "⏳ **Search Timed Out**\nPlease try again in a moment."
             )
         except Exception as e:
+            print(f"Search error: {e}", flush=True)
             status = await status_task
             return await status.edit_text(
-                "❌ **Search Error**\n" f"**Details:** `{e}`"
+                "❌ **Search failed.** Please try again later."
             )
 
         if not song or not song.get("stream_url"):
             status = await status_task
+            if youtube_is_blocked():
+                return await status.edit_text(
+                    "⚠️ **YouTube is temporarily blocking requests.**\n"
+                    "The owner has been notified. Please try again later."
+                )
             return await status.edit_text(
-                "❌ **No Results Found**\n"
-                "Could not find a matching track. Please try a different title or lyric."
+                "❌ **No Results Found**\nTry a different title or add the artist name."
+            )
+
+        max_sec = config.MAX_DURATION_MIN * 60
+        if max_sec and song.get("duration") and song["duration"] > max_sec:
+            status = await status_task
+            return await status.edit_text(
+                f"⚠️ Track is too long. Max allowed: {config.MAX_DURATION_MIN} minutes."
             )
 
         song["requester"] = requester
+        song["requester_id"] = user_id
 
-        if chat_id not in queues:
-            queues[chat_id] = deque()
+        async with locks[chat_id]:
+            queue = queues.setdefault(chat_id, deque())
 
-        queues[chat_id].append(song)
+            if len(queue) >= config.MAX_QUEUE:
+                status = await status_task
+                return await status.edit_text(
+                    f"⚠️ Queue is full (max {config.MAX_QUEUE} tracks)."
+                )
 
-        if len(queues[chat_id]) == 1:
-            try:
-                await start_stream(chat_id, song, status_task=status_task)
-            except Exception as e:
-                queues.pop(chat_id, None)
+            queue.append(song)
+            position = len(queue) - 1
+
+            if position == 0:
+                try:
+                    await start_stream(chat_id, song, status_task=status_task)
+                except Exception as e:
+                    print(f"Playback error in {chat_id}: {e}", flush=True)
+                    queues.pop(chat_id, None)
+                    status = await status_task
+                    await status.edit_text(
+                        "❌ **Playback Error**\n"
+                        "Please make sure a **Voice Chat** is active in this group, "
+                        "then try again."
+                    )
+            else:
                 status = await status_task
                 await status.edit_text(
-                    "❌ **Playback Error**\n"
-                    "Please ensure a **Voice Chat** is active in the group first.\n\n"
-                    f"**Details:** `{e}`"
+                    f"➕ **Added to Queue (#{position})**\n"
+                    f"**Track:** {song['title']}\n"
+                    f"**Requested by:** {requester}"
                 )
-        else:
-            status = await status_task
-            await status.edit_text(
-                f"➕ **Added to Queue (#{len(queues[chat_id]) - 1})**\n"
-                f"**Track:** {song['title']}\n"
-                f"**Requested by:** {requester}"
-            )
+
+    DENIED = "🚫 Only group admins or the person who requested the current track can do this."
 
     @bot.on_message(filters.command("pause") & filters.group)
     async def pause_cmd(_, message: Message):
+        uid = message.from_user.id if message.from_user else None
+        if not await can_control(message.chat.id, uid):
+            return await message.reply_text(DENIED)
         try:
             await call_py.pause(message.chat.id)
             await message.reply_text("⏸ **Playback paused.**")
-        except Exception as e:
-            await message.reply_text(f"❌ **Nothing to pause.**\n`{e}`")
+        except Exception:
+            await message.reply_text("❌ Nothing is playing right now.")
 
     @bot.on_message(filters.command("resume") & filters.group)
     async def resume_cmd(_, message: Message):
+        uid = message.from_user.id if message.from_user else None
+        if not await can_control(message.chat.id, uid):
+            return await message.reply_text(DENIED)
         try:
             await call_py.resume(message.chat.id)
             await message.reply_text("▶️ **Playback resumed.**")
-        except Exception as e:
-            await message.reply_text(f"❌ **Nothing to resume.**\n`{e}`")
+        except Exception:
+            await message.reply_text("❌ Nothing to resume.")
 
     @bot.on_message(filters.command("skip") & filters.group)
     async def skip_cmd(_, message: Message):
-        if not queues.get(message.chat.id):
-            return await message.reply_text("📭 **Nothing is playing.**")
+        chat_id = message.chat.id
+        uid = message.from_user.id if message.from_user else None
+        if not queues.get(chat_id):
+            return await message.reply_text("📭 Nothing is playing.")
+        if not await can_control(chat_id, uid):
+            return await message.reply_text(DENIED)
         await message.reply_text("⏭ **Skipped to the next track.**")
-        await play_next(message.chat.id)
+        await play_next(chat_id)
 
     @bot.on_message(filters.command("stop") & filters.group)
     async def stop_cmd(_, message: Message):
         chat_id = message.chat.id
-        queues.pop(chat_id, None)
+        uid = message.from_user.id if message.from_user else None
+        if not await can_control(chat_id, uid):
+            return await message.reply_text(DENIED)
+        async with locks[chat_id]:
+            queues.pop(chat_id, None)
         try:
             await call_py.leave_call(chat_id)
         except Exception:
             pass
-        await message.reply_text(
-            "⏹ **Playback stopped and disconnected from Voice Chat.**"
-        )
+        await message.reply_text("⏹ **Playback stopped and disconnected from Voice Chat.**")
 
     @bot.on_message(filters.command("queue") & filters.group)
     async def queue_cmd(_, message: Message):
         queue = queues.get(message.chat.id)
         if not queue:
-            return await message.reply_text(
-                "📭 **The playback queue is currently empty.**"
-            )
-        text = "📜 **Current Playback Queue**\n\n"
+            return await message.reply_text("📭 **The queue is empty.**")
+        text = "📜 **Current Queue**\n\n"
         for i, item in enumerate(queue):
             prefix = "▶️ **Now:**" if i == 0 else f"**{i}.**"
             text += f"{prefix} {item['title']}\n"
@@ -340,6 +411,12 @@ async def main():
     async def button_handler(_, query: CallbackQuery):
         chat_id = query.message.chat.id
         data = query.data
+        user_id = query.from_user.id if query.from_user else None
+
+        if not await can_control(chat_id, user_id):
+            return await query.answer(
+                "Only admins or the requester can use these buttons.", show_alert=True
+            )
         try:
             if data == "pause":
                 await call_py.pause(chat_id)
@@ -351,15 +428,63 @@ async def main():
                 await query.answer("⏭ Skipping track...")
                 await play_next(chat_id)
             elif data == "stop":
-                queues.pop(chat_id, None)
+                async with locks[chat_id]:
+                    queues.pop(chat_id, None)
                 try:
                     await call_py.leave_call(chat_id)
                 except Exception:
                     pass
                 await query.answer("⏹ Playback stopped")
-                await query.message.edit_text("⏹ **Playback stopped by user.**")
+                await query.message.edit_text("⏹ **Playback stopped.**")
         except Exception as e:
-            await query.answer(f"Error: {e}", show_alert=True)
+            print(f"Button error: {e}", flush=True)
+            await query.answer("Something went wrong. Is a track playing?", show_alert=True)
+
+    # ---------- owner: alerts + cookies upload ----------
+
+    async def notify_owner_block():
+        for oid in config.OWNER_IDS:
+            try:
+                await bot.send_message(
+                    oid,
+                    "⚠️ YouTube is blocking the bot (bot-check).\n"
+                    "Send me a fresh `cookies.txt` file here, or check the POT provider.",
+                )
+            except Exception as e:
+                print(f"Owner alert failed: {e}", flush=True)
+
+    set_block_callback(notify_owner_block)
+
+    @bot.on_message(filters.private & filters.command("cookies"))
+    async def cookies_help(_, message: Message):
+        if not message.from_user or message.from_user.id not in config.OWNER_IDS:
+            return
+        await message.reply_text(
+            "Send your YouTube `cookies.txt` as a **file** in this chat. "
+            "I'll load it immediately, no redeploy needed."
+        )
+
+    @bot.on_message(filters.private & filters.document)
+    async def cookies_upload(_, message: Message):
+        if not message.from_user or message.from_user.id not in config.OWNER_IDS:
+            return
+        doc = message.document
+        if not (doc.file_name or "").lower().endswith(".txt"):
+            return await message.reply_text("⚠️ Please send a `.txt` cookies file.")
+        if doc.file_size and doc.file_size > 2_000_000:
+            return await message.reply_text("⚠️ File too large.")
+        buf = await message.download(in_memory=True)
+        text = buf.getvalue().decode("utf-8", errors="ignore")
+        if "youtube.com" not in text:
+            return await message.reply_text(
+                "⚠️ This doesn't look like a YouTube cookies file."
+            )
+        set_cookies(text)
+        await message.reply_text("✅ Cookies updated. Try /play now.")
+        try:
+            await message.delete()  # cookies chat me na rahein
+        except Exception:
+            pass
 
     # ---------- start ----------
 
@@ -368,6 +493,7 @@ async def main():
     await assistant.start()
     await call_py.start()
     print(f"✅ @{me.username} is LIVE!", flush=True)
+    asyncio.create_task(keep_pot_alive())
     await asyncio.Event().wait()
 
 
