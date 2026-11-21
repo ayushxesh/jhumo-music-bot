@@ -28,13 +28,20 @@ from sources import (
     set_block_callback,
     keep_pot_alive,
     youtube_is_blocked,
+    check_stream,
 )
 
 queues: dict[int, deque] = {}
 locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 verified_chats: set[int] = set()
 
+DEBUG = os.environ.get("YT_DEBUG") == "1"
 FFMPEG_PARAMS = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
+AUDIO_QUALITY = getattr(
+    AudioQuality,
+    os.environ.get("AUDIO_QUALITY", "HIGH").strip().upper(),
+    AudioQuality.HIGH,
+)
 
 
 # ---------------- health server (Render ke liye) ----------------
@@ -82,6 +89,21 @@ def control_buttons():
             ],
         ]
     )
+
+
+def build_stream(song: dict) -> MediaStream:
+    kwargs = dict(
+        audio_parameters=AUDIO_QUALITY,
+        video_flags=MediaStream.Flags.IGNORE,
+        ffmpeg_parameters=FFMPEG_PARAMS,
+    )
+    headers = song.get("headers")
+    if headers:
+        try:
+            return MediaStream(song["stream_url"], headers=headers, **kwargs)
+        except TypeError:
+            print("⚠️ Is pytgcalls version me headers option nahi hai", flush=True)
+    return MediaStream(song["stream_url"], **kwargs)
 
 
 async def main():
@@ -163,16 +185,14 @@ async def main():
     async def start_stream(
         chat_id: int, song: dict, status_task: asyncio.Task | None = None
     ):
-        print(f"▶️ STREAM: {song['title']} | {song['stream_url'][:100]}", flush=True)
-        await call_py.play(
-            chat_id,
-            MediaStream(
-                song["stream_url"],
-                audio_parameters=AudioQuality.HIGH,
-                video_flags=MediaStream.Flags.IGNORE,
-                ffmpeg_parameters=FFMPEG_PARAMS,
-            ),
+        check = "skipped"
+        if DEBUG:
+            check = await check_stream(song["stream_url"], song.get("headers"))
+        print(
+            f"▶️ STREAM: {song['title']} | check={check} | {song['stream_url'][:80]}",
+            flush=True,
         )
+        await call_py.play(chat_id, build_stream(song))
         asyncio.create_task(send_now_playing(chat_id, song, status_task))
 
     async def play_next(chat_id: int):
@@ -279,7 +299,7 @@ async def main():
             )
 
         try:
-            song = await asyncio.wait_for(song_task, timeout=45)
+            song = await asyncio.wait_for(song_task, timeout=60)
         except asyncio.TimeoutError:
             status = await status_task
             return await status.edit_text(
@@ -297,8 +317,7 @@ async def main():
             if youtube_is_blocked():
                 return await status.edit_text(
                     "⚠️ **YouTube is temporarily blocking requests.**\n"
-                    "The owner has been notified. "
-                    "For the fastest fix, update the bot's `cookies.txt` or POT provider."
+                    "The owner has been notified. Please try again later."
                 )
             return await status.edit_text(
                 "❌ **No Results Found**\nTry a different title or add the artist name."
@@ -493,7 +512,10 @@ async def main():
     me = await bot.get_me()
     await assistant.start()
     await call_py.start()
-    print(f"✅ @{me.username} is LIVE!", flush=True)
+    print(
+        f"✅ @{me.username} is LIVE! | debug={DEBUG} | audio={AUDIO_QUALITY}",
+        flush=True,
+    )
     asyncio.create_task(keep_pot_alive())
     await asyncio.Event().wait()
 
